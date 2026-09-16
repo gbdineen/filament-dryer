@@ -12,6 +12,8 @@
 #include "Adafruit_SHT31.h" 
 #include <Thermistor.h>
 #include <NTC_Thermistor.h>
+#include "driver/mcpwm.h"
+// #include "driver/mcpwm_prelude.h"
 
 #define PIN_INPUT 7
 #define PIN_OUTPUT 8
@@ -29,6 +31,13 @@
 // ESP32 ADC Resolution: 12-bit (0 to 4095)
 #define ESP32_ADC_RESOLUTION 4095
 
+#define PWM_OUTPUT_PIN 7
+
+// Setup step-up and step-down tracking
+float dutyCycle = 0.0;
+bool increasing = true;
+ int activeState;
+
 int SDA_0 = 5;
 int SCL_0 = 6;
 Adafruit_seesaw ss;
@@ -39,13 +48,10 @@ int32_t encoder_position;
 double pidSetpoint, pidInput, pidOutput;
 
 
-  // kp: 0.49460
-  //     ki: 0.00487
-  //     kd: 12.56301
 
 // Specify the links and initial tuning parameters
-// double Kp = 0.49460, Ki = 0.00487, Kd =  1.56301;
-double Kp = 3.0, Ki = 0.05, Kd = 1.0;
+double Kp = 0.49460, Ki = 0.00487, Kd =  1.56301;
+// double Kp = 0.0, Ki = 0.0, Kd = 1.0;
 PID myPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
 Thermistor* thermistor;
 
@@ -58,7 +64,7 @@ const int freq = 50 ;      // PWM frequency in Hertz (5 kHz)
 const int channel = 0;      // LEDC channel (0-7 on ESP32-S3)
 const int resolution = 8;   // Resolution in bits (8-bit = values from 0 to 255)
 
-int dutyCycle;
+// int dutyCycle;
 
 int WindowSize = 500;
 unsigned long windowStartTime;
@@ -84,12 +90,22 @@ void setup()
   Serial.begin(115200);
   while (!Serial) delay(10);
 
-  windowStartTime = millis();
+   // Initialize the MCPWM GPIO for Unit 0, Operator A
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, PWM_OUTPUT_PIN);
 
-  // pinMode(PIN_OUTPUT, OUTPUT); 
-  // pinMode(PWM_PIN, OUTPUT);
+    // Configure MCPWM settings
+  mcpwm_config_t pwm_config;
+  pwm_config.frequency = 1000;             // Frequency = 1kHz
+  pwm_config.cmpr_a = 0;                  // Initial duty cycle for PWM0A = 0%
+  pwm_config.cmpr_b = 0;                  // Initial duty cycle for PWM0B = 0%
+  pwm_config.counter_mode = MCPWM_UP_COUNTER;
+  pwm_config.duty_mode = MCPWM_DUTY_MODE_0; // Active HIGH puls
 
-
+    // Initialize MCPWM Unit 0, Timer 0 with our configuration
+  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);
+  
+  // Format headers for Arduino IDE 2.x Serial Plotter
+  Serial.println("Duty_Cycle_Pct,Live_PWM_State");
 
 
   /********************************************************
@@ -135,23 +151,7 @@ void setup()
   /********************************************************
    PID
   ********************************************************/
-  // analogSetAttenuation(ADC_2_5db);
-  // analogSetWidth(12); 
 
-  // thermistor = new NTC_Thermistor(
-  //   PIN_INPUT, 
-  //   REFERENCE_RESISTANCE, 
-  //   SENSOR_RESISTANCE, 
-  //   NOMINAL_TEMPERATURE, 
-  //   B_COEFFICIENT, 
-  //   ESP32_ADC_RESOLUTION
-  // );
-
-  //    // 1. Configure LEDC channel functionality
-  // ledcSetup(channel, freq, resolution);
-  
-  // // 2. Attach the channel to the specified GPIO pin
-  // ledcAttachPin(PIN_OUTPUT, channel);
   
   pidSetpoint = 60.0;
   // initialize the variables we're linked to
@@ -159,7 +159,7 @@ void setup()
 
   // 1. CRITICAL FOR ANTI-WINDUP: Set limits matching your ESP32 PWM resolution.
   // For standard 8-bit PWM (0-255). For 10-bit ESP32 ledc, use (0, 1023).
-  myPID.SetOutputLimits(0, WindowSize);
+  // myPID.SetOutputLimits(0, WindowSize);
   
   // myPID.SetSampleTime(500); 
   // turn the PID on
@@ -205,104 +205,55 @@ void loop()
   pidInput = t;
   myPID.Compute();
   // analogWrite(PIN_OUTPUT, pidOutput);
-  // ledcWrite(channel, pidOutput);
-  // ledcWrite(0, pidOutput);
-  // analogWrite(PIN_OUTPUT, pidOutput);
 
-    /************************************************
-   * turn the output pin on/off based on pid output
-   ************************************************/
-  // if (millis() - windowStartTime > WindowSize)
-  // { //time to shift the Relay Window
-  //   windowStartTime += WindowSize;
+
+  if (increasing) { 
+    dutyCycle += 1.0;
+    if (dutyCycle >= 100.0) increasing = false;
+  } else {
+    dutyCycle -= 1.0;
+    if (dutyCycle <= 0.0) increasing = true;
+  }
+
+    //   Serial.print(">");
+    // // Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
+    // // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
+    // Serial.print("pidOutput:"); Serial.println(pidOutput);
+    // Serial.print("activeState:"); Serial.println(activeState);
+
+  // Apply the updated duty cycle to MCPWM Unit 0, Timer 0, Operator A
+   mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, dutyCycle);
+   Serial.print(mcpwm_read)
+
+    long result = map(pidOutput, 0, 60, 0, 255);
+
+    // mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, result);
+
+
+
+    for (int i = 0; i < 20; i++) {
+         int activeState = (i < (dutyCycle / 5.0)) ? 100 : 0;
+
+      Serial.print(">");
+      Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
+      // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
+      Serial.print("activeState:"); Serial.println(activeState);
+      delay(2);
+    }
+    // Generate a visualization of the high/low state based on loop timing
+  // for (int i = 0; i < 20; i++) {
+  //   // Generate a pseudo-square wave relative to the current duty cycle
+  //   activeState = (i < (pidOutput / 5.0)) ? 100 : 0;
+  //         // Print values in comma-separated format for the Serial Plotter
+  //   // Serial.print(">");
+  //   // // Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
+  //   // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
+  //   // Serial.print("activeState:"); Serial.println(activeState);
+
   // }
-  // if (pidOutput < millis() - windowStartTime) digitalWrite(PIN_OUTPUT, HIGH);
-  // else digitalWrite(PIN_OUTPUT, LOW);
-
-  // Serial.println(ledcRead(PIN_OUTPUT));
-
-  digitalWrite(PIN_OUTPUT, pidOutput);
-
-    // Plotter outputSD
-  Serial.print(">");
-  Serial.print("Setpoint:");   Serial.print(pidSetpoint); Serial.print(",");
-  Serial.print("CurrentTemp:");Serial.print(pidInput);    Serial.print(",");
-  // Serial.print("PWM_OUTPUT:"); Serial.println(ledcRead(0));
-  // Serial.print("PWM:"); Serial.println(pidOutput);
-   Serial.print("PWM:"); Serial.println(digitalRead(PIN_OUTPUT));
 
 
 
+    // delay(1000);
 
-  delay(500);
-  // Input = analogRead(PIN_INPUT);
-  // myPID.Compute();
-  // analogWrite(PIN_OUTPUT, Output);
 }
-
-// void loop()
-// {
-//   /********************************************************
-//    Rotary Encoder
-//   ********************************************************/
-//    if (! ss.digitalRead(SS_SWITCH)) {
-//     Serial.println("Button pressed!");
-//   }
-
-//   int32_t new_position = ss.getEncoderPosition();
-//   // did we move arounde?
-//   if (encoder_position != new_position) {
-//     Serial.println(new_position);         // display new position
-
-//     // pidInput = new_position;
-
-//     // change the neopixel color
-//     sspixel.setPixelColor(0, Wheel(new_position & 0xFF));
-//     sspixel.show();
-//     encoder_position = new_position;      // and save for next round
-//   }
-
-//   /********************************************************
-//    PID
-//   ********************************************************/
-
-//     // Read raw 12-bit ADC (0 to 4095) from Pin 7
-//   // int rawADC = analogRead(PIN_INPUT);
-//   uint32_t adcSum = 0;
-//   for(int i = 0; i < 64; i++) {
-//     adcSum += analogRead(PIN_INPUT);
-//   }
-//   int rawADC = adcSum / 64; // The averaged, clean signal
-
-//   // Safeguard: Prevent division-by-zero errors if the sensor unplugs
-//   if (rawADC >= 4095) rawADC = 4094;
-//   if (rawADC <= 0) rawADC = 1;
-
-//   // Calculate the exact real-time resistance of your 100k Thermistor
-//   // Formula based on your 10k Ohm series divider reference resistor
-//   double thermistorResistance = REFERENCE_RESISTANCE * ((4095.0 / (double)rawADC) - 1.0);
-
-//   // Apply the Steinhart-Hart Beta Equation to solve for Kelvin
-//   double kelvin = thermistorResistance / (double)SENSOR_RESISTANCE; // (R/Ro)
-//   kelvin = log(kelvin);                                            // ln(R/Ro)
-//   kelvin /= (double)B_COEFFICIENT;                                 // 1/B * ln(R/Ro)
-//   kelvin += 1.0 / ((double)NOMINAL_TEMPERATURE + 273.15);          // + (1/To)
-//   kelvin = 1.0 / kelvin;                                           // Invert to get Kelvin
-
-//   // Convert Kelvin down to real Celsius
-//   double realCelsius = kelvin - 273.15;
-
-//   // Pass the mathematically perfect temperature straight into your PID loop
-//   pidInput = realCelsius;
-  
-//   myPID.Compute();
-//   analogWrite(PIN_OUTPUT, pidOutput);
-
-//   // Plotter output
-//   Serial.print(">");
-//   Serial.print("Setpoint:");   Serial.print(pidSetpoint); Serial.print(",");
-//   Serial.print("CurrentTemp:");Serial.print(pidInput);    Serial.print(",");
-//   Serial.print("MOSFET_PWM:"); Serial.println(pidOutput);
-  
-//   delay(10);
-// }
