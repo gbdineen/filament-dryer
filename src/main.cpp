@@ -10,33 +10,22 @@
 #include <seesaw_neopixel.h>
 #include <PID_v1.h>
 #include "Adafruit_SHT31.h" 
-#include <Thermistor.h>
-#include <NTC_Thermistor.h>
-#include "driver/mcpwm.h"
+// #include "driver/mcpwm.h"
+// #include "tempSensors.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
 // #include "driver/mcpwm_prelude.h"
 
-#define PIN_INPUT 7
-#define PIN_OUTPUT 8
-#define WIRE Wire
+// #define PIN_OUTPUT 8
 #define SEESAW_ADDR 0x36
 #define SS_SWITCH 24
 #define SS_NEOPIX  6
 
-// Thermistor Parameters (Standard 3D Printer / Heater NTC 100K 3950 setup)
-#define SENSOR_RESISTANCE   100000  // 100k Ohm Thermistor at 25 degrees C
-#define REFERENCE_RESISTANCE 10000  // 10k Ohms (Your two 5k resistors in series)
-#define B_COEFFICIENT       3950    // The beta factor of your thermistor
-#define NOMINAL_TEMPERATURE 25      // Temperature for nominal resistance
+#define ONE_WIRE_BUS 1
+#define WIRE Wire
 
-// ESP32 ADC Resolution: 12-bit (0 to 4095)
-#define ESP32_ADC_RESOLUTION 4095
-
-#define PWM_OUTPUT_PIN 7
-
-// Setup step-up and step-down tracking
-float dutyCycle = 0.0;
-bool increasing = true;
- int activeState;
+OneWire oneWire(ONE_WIRE_BUS);
 
 int SDA_0 = 5;
 int SCL_0 = 6;
@@ -44,30 +33,30 @@ Adafruit_seesaw ss;
 seesaw_NeoPixel sspixel = seesaw_NeoPixel(1, SS_NEOPIX, NEO_GRB + NEO_KHZ800);
 int32_t encoder_position;
 
-// Define Variables we'll be connecting to
-double pidSetpoint, pidInput, pidOutput;
-
-
-
-// Specify the links and initial tuning parameters
-double Kp = 0.49460, Ki = 0.00487, Kd =  1.56301;
-// double Kp = 0.0, Ki = 0.0, Kd = 1.0;
-PID myPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
-Thermistor* thermistor;
-
-bool enableHeater = false;
+bool enableHeater = true;
 uint8_t loopCnt = 0;
-
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 
-const int freq = 50 ;      // PWM frequency in Hertz (5 kHz)
-const int channel = 0;      // LEDC channel (0-7 on ESP32-S3)
-const int resolution = 8;   // Resolution in bits (8-bit = values from 0 to 255)
+DallasTemperature sensors(&oneWire);
 
-// int dutyCycle;
+double pidSetpoint, pidInput, pidOutput;
+// double Kp = 0.49460, Ki = 0.00487, Kd =  1.56301;
+double Kp = 16;
+double Ki = 0;
+double Kd = 0;
+PID myPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
 
-int WindowSize = 500;
+int WindowSize = 5000;
 unsigned long windowStartTime;
+
+// Pin definitions
+const int PWM_PIN = 2;   // D2 on XIAO = GPIO 3
+const int POT_PIN = A0;  // A0 on XIAO = GPIO 26
+const int LED_PIN = 21;
+
+// PWM settings
+const int PWM_FREQ = 5000;    // 25 kHz frequency for computer fans
+const int PWM_RESOLUTION = 8;  // 8-bit resolution (0-255)
 
 
 uint32_t Wheel(byte WheelPos) { 
@@ -90,170 +79,116 @@ void setup()
   Serial.begin(115200);
   while (!Serial) delay(10);
 
-   // Initialize the MCPWM GPIO for Unit 0, Operator A
-  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, PWM_OUTPUT_PIN);
+  windowStartTime = millis();
+  pidSetpoint = 60;
 
-    // Configure MCPWM settings
-  mcpwm_config_t pwm_config;
-  pwm_config.frequency = 1000;             // Frequency = 1kHz
-  pwm_config.cmpr_a = 0;                  // Initial duty cycle for PWM0A = 0%
-  pwm_config.cmpr_b = 0;                  // Initial duty cycle for PWM0B = 0%
-  pwm_config.counter_mode = MCPWM_UP_COUNTER;
-  pwm_config.duty_mode = MCPWM_DUTY_MODE_0; // Active HIGH puls
-
-    // Initialize MCPWM Unit 0, Timer 0 with our configuration
-  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);
-  
-  // Format headers for Arduino IDE 2.x Serial Plotter
-  Serial.println("Duty_Cycle_Pct,Live_PWM_State");
-
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
 
   /********************************************************
-   Rotary Encoder
- ********************************************************/
-
-  // Serial.println("Looking for seesaw!");
-  
-  // if (! ss.begin(SEESAW_ADDR) || ! sspixel.begin(SEESAW_ADDR)) {
-  //   Serial.println("Couldn't find seesaw on default address");
-  //   while(1) delay(10);
-  // }
-  // Serial.println("seesaw started");
-
-  // // set not so bright!
-  // sspixel.setBrightness(20);
-  // sspixel.show();
-  
-  // // use a pin for the built in encoder switch
-  // ss.pinMode(SS_SWITCH, INPUT_PULLUP);
-
-  // // get starting position
-  // encoder_position = ss.getEncoderPosition();
-
-  // Serial.println("Turning on interrupts");
-  // delay(10);
-  // ss.setGPIOInterrupts((uint32_t)1 << SS_SWITCH, 1);
-  // ss.enableEncoderInterrupt();
-
-  /// SHT
-
+   SHT
+  ********************************************************/
   if (! sht31.begin(0x44)) {   // Set to 0x45 for alternate i2c addr
     Serial.println("Couldn't find SHT31");
     while (1) delay(1);
   }
-
-  Serial.print("Heater Enabled State: ");
-  if (sht31.isHeaterEnabled())
-    Serial.println("ENABLED");
-  else
-    Serial.println("DISABLED");
+  // Serial.print("Heater Enabled State: ");
+  // if (sht31.isHeaterEnabled())
+  //   Serial.println("ENABLED");
+  // else
+  //   Serial.println("DISABLED");
 
   /********************************************************
-   PID
+   PID 
   ********************************************************/
 
-  
-  pidSetpoint = 60.0;
-  // initialize the variables we're linked to
-  // pidInput = analogRead(PIN_INPUT);
 
   // 1. CRITICAL FOR ANTI-WINDUP: Set limits matching your ESP32 PWM resolution.
   // For standard 8-bit PWM (0-255). For 10-bit ESP32 ledc, use (0, 1023).
-  // myPID.SetOutputLimits(0, WindowSize);
+  myPID.SetOutputLimits(0, 255);
   
-  // myPID.SetSampleTime(500); 
+  // myPID.SetSampleTime(5000); 
   // turn the PID on
   myPID.SetMode(AUTOMATIC);
+
+   /********************************************************
+   THERMISTOR
+  ********************************************************/
+  sensors.begin();
 }
 
 void loop()
 {
-  ///// SHT
-  float t = sht31.readTemperature();
-  float h = sht31.readHumidity();
+  /********************************************************
+   SHT
+  ********************************************************/
+  uint16_t t = sht31.readTemperature();
+  // float h = sht31.readHumidity();
 
   if (! isnan(t)) {  // check if 'is not a number'
-    Serial.print("Temp *C = "); Serial.print(t); Serial.print("\t\t");
+    // Serial.print("Temp *C = "); Serial.print(t); Serial.print("\t\t");
   } else { 
     Serial.println("Failed to read temperature");
   }
   
-  if (! isnan(h)) {  // check if 'is not a number'
-    Serial.print("Hum. % = "); Serial.println(h);
-  } else { 
-    Serial.println("Failed to read humidity");
-  }
+  // if (! isnan(h)) {  // check if 'is not a number'
+  //   // Serial.print("Hum. % = "); Serial.println(h);
+  // } else { 
+  //   Serial.println("Failed to read humidity");
+  // }
 
   // delay(1000);
 
   // Toggle heater enabled state every 30 seconds
   // An ~3.0 degC temperature increase can be noted when heater is enabled
-  if (loopCnt >= 30) {
-    enableHeater = !enableHeater;
-    sht31.heater(enableHeater);
-    Serial.print("Heater Enabled State: ");
-    if (sht31.isHeaterEnabled())
-      Serial.println("ENABLED");
-    else
-      Serial.println("DISABLED");
+  // if (loopCnt >= 30) {
+  //   enableHeater = !enableHeater;
+  //   sht31.heater(enableHeater);
+  //   Serial.print("Heater Enabled State: ");
+  //   if (sht31.isHeaterEnabled())
+  //     Serial.println("ENABLED");
+  //   else
+  //     Serial.println("DISABLED");
 
-    loopCnt = 0;
-  }
-  loopCnt++;
+  //   loopCnt = 0;
+  // }
+  // loopCnt++;
+  
 
-  // pidInput = analogRead(PIN_INPUT);
-  pidInput = t;
-  myPID.Compute();
-  // analogWrite(PIN_OUTPUT, pidOutput);
+  /********************************************************
+   THERMISTOR
+  ********************************************************/
+  // Send the command to get temperatures from all sensors on the bus
+  // sensors.requestTemperatures(); 
 
+  // // // Fetch the temperature in Celsius for the first sensor (index 0)
+  // float tempC = sensors.getTempCByIndex(0);
+  // float tempF;
 
-  if (increasing) { 
-    dutyCycle += 1.0;
-    if (dutyCycle >= 100.0) increasing = false;
-  } else {
-    dutyCycle -= 1.0;
-    if (dutyCycle <= 0.0) increasing = true;
-  }
-
-    //   Serial.print(">");
-    // // Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
-    // // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
-    // Serial.print("pidOutput:"); Serial.println(pidOutput);
-    // Serial.print("activeState:"); Serial.println(activeState);
-
-  // Apply the updated duty cycle to MCPWM Unit 0, Timer 0, Operator A
-   mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, dutyCycle);
-   Serial.print(mcpwm_read)
-
-    long result = map(pidOutput, 0, 60, 0, 255);
-
-    // mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, result);
-
-
-
-    for (int i = 0; i < 20; i++) {
-         int activeState = (i < (dutyCycle / 5.0)) ? 100 : 0;
-
-      Serial.print(">");
-      Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
-      // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
-      Serial.print("activeState:"); Serial.println(activeState);
-      delay(2);
-    }
-    // Generate a visualization of the high/low state based on loop timing
-  // for (int i = 0; i < 20; i++) {
-  //   // Generate a pseudo-square wave relative to the current duty cycle
-  //   activeState = (i < (pidOutput / 5.0)) ? 100 : 0;
-  //         // Print values in comma-separated format for the Serial Plotter
-  //   // Serial.print(">");
-  //   // // Serial.print("dutyCycle:"); Serial.print(dutyCycle); Serial.print(",");
-  //   // Serial.print("pidOutput:"); Serial.print(pidOutput); Serial.print(",");
-  //   // Serial.print("activeState:"); Serial.println(activeState);
-
+  // // // Check if the reading is valid before printing
+  // if(tempC != DEVICE_DISCONNECTED_C) {
+  //   // Serial.print("Temperature: ");
+  //   // Serial.print(tempC);
+  //   // Serial.print(" °C  |  ");
+    
+  //   // Convert Celsius to Fahrenheit
+  //   // float tempF = DallasTemperature::toFahrenheit(tempC);
+  //   // Serial.print(tempF);
+  //   // Serial.println(" °F");
+  // } else {
+  //   Serial.println("Error: Could not read temperature data. Check connections.");
   // }
 
+  pidInput = t;
+  // pidInput = tempC;
+  myPID.Compute();
 
+  ledcWrite(PWM_PIN, int(pidOutput));
 
-    // delay(1000);
+  Serial.print(">");
+  Serial.print("pidInput:");Serial.print(t);Serial.print(",");
+  Serial.print("pidOutput:");Serial.print(int(pidOutput));Serial.print(",");
+  Serial.print("setPoint:");Serial.println(pidSetpoint);
+
+  delay(500);
 
 }
